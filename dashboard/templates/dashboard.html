@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="Smart Office Microclimate real-time monitoring dashboard">
+    <title>Smart Office Dashboard</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+
+<body>
+    <header>
+        <h1>Transformation Office</h1>
+        <div class="header-controls">
+            <span id="connection-status" class="status-dot status-disconnected"></span>
+            <button id="btn-demo-toggle" class="btn btn-demo">Demo Mode</button>
+        </div>
+    </header>
+
+    <main>
+        <section class="kpi-grid" id="kpi-section">
+            <div class="kpi-card" id="kpi-temperature">
+                <span class="kpi-icon"><i data-lucide="thermometer"></i></span>
+                <span class="kpi-value" id="val-temperature">--</span>
+                <span class="kpi-label">Temperature</span>
+            </div>
+            <div class="kpi-card" id="kpi-humidity">
+                <span class="kpi-icon"><i data-lucide="droplets"></i></span>
+                <span class="kpi-value" id="val-humidity">--</span>
+                <span class="kpi-label">Humidity</span>
+            </div>
+            <div class="kpi-card" id="kpi-headcount">
+                <span class="kpi-icon"><i data-lucide="users"></i></span>
+                <span class="kpi-value" id="val-headcount">--</span>
+                <span class="kpi-label">People</span>
+            </div>
+            <div class="kpi-card" id="kpi-door">
+                <span class="kpi-icon"><i data-lucide="door-open"></i></span>
+                <span class="kpi-value" id="val-door">--</span>
+                <span class="kpi-label">Door</span>
+            </div>
+            <div class="kpi-card" id="kpi-ac">
+                <span class="kpi-icon"><i data-lucide="snowflake"></i></span>
+                <span class="kpi-value" id="val-ac">--</span>
+                <span class="kpi-label">AC</span>
+            </div>
+        </section>
+
+        <section class="chart-container">
+            <canvas id="chart-temp-humidity"></canvas>
+        </section>
+
+        <section class="bottom-grid">
+            <div class="panel override-panel">
+                <h2>Manual Override</h2>
+                <div class="override-controls">
+                    <button id="btn-ac-on" class="btn btn-ac-on">AC ON</button>
+                    <button id="btn-ac-off" class="btn btn-ac-off">AC OFF</button>
+                    <div class="temp-control">
+                        <label for="set-temp">Set Temp:</label>
+                        <input type="number" id="set-temp" min="18" max="30" value="24">
+                        <button id="btn-set-temp" class="btn btn-set-temp">Set</button>
+                    </div>
+                </div>
+                <div class="ac-health">
+                    <span>AC Health: </span>
+                    <span id="ac-health-status" class="status-normal">OK</span>
+                </div>
+            </div>
+            <div class="panel event-log-panel">
+                <h2>Event Log</h2>
+                <div class="event-log-scroll">
+                    <table id="event-log-table">
+                        <thead>
+                            <tr>
+                                <th>Time</th>
+                                <th>Type</th>
+                                <th>Message</th>
+                            </tr>
+                        </thead>
+                        <tbody id="event-log-body"></tbody>
+                    </table>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+    <script src="{{ url_for('static', filename='js/dashboard.js') }}"></script>
+</body>
+
+</html>
