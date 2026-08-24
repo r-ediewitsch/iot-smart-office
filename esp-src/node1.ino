@@ -12,6 +12,9 @@
 #define DHTPIN 4
 #define DHTTYPE DHT22
 
+const unsigned long DOOR_TIMEOUT_SEC   = 180;
+const unsigned long AC_HEALTH_CHECK_MS = 1800000; // 30 menit
+
 struct SharedData {
   float temp;
   float humidity;
@@ -33,7 +36,7 @@ DHT dht(DHTPIN, DHTTYPE);
 unsigned long acTurnOnTime = 0;
 float tempWhenTurnedOn = 0.0;
 
-// ================= TASK 2: READ SENSOR DHT 22 =================
+// ================= TASK 1: READ SENSOR DHT 22 =================
 void Task_DHT22_Read(void *pvParameters) {
   TickType_t xLastWakeTime = xTaskGetTickCount();
   for (;;) {
@@ -104,6 +107,88 @@ void Task_HTTP_Telemetry(void *pvParameters) {
   }
 }
 
+// ================= TASK 3: AC CLIMATE LOGIC =================
+void Task_AC_Logic(void *pvParameters) {
+  for (;;) {
+    SharedData localData;
+    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+      localData = sharedData;
+      xSemaphoreGive(dataMutex);
+    }
+
+    // 1. AUTO-OFF: Ruangan Kosong atau Pintu Terbuka Melebihi Batas
+    if (localData.acStatus) {
+      if (localData.headcount <= 0 || (localData.doorOpen && localData.doorOpenSec > DOOR_TIMEOUT_SEC)) {
+        // IR Command to turn off the AC
+
+        if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+          sharedData.acStatus = false;
+          xSemaphoreGive(dataMutex);
+        }
+        Serial.println("[LOGIKA] AC dimatikan otomatis (Pintu Terbuka/Ruangan Kosong).");
+      }
+    }
+
+    // 2. AUTO-ON: Ada Orang & Pintu Tidak Bocor
+    if (!localData.acStatus && localData.headcount > 0 && !(localData.doorOpen && localData.doorOpenSec > DOOR_TIMEOUT_SEC)) {
+      // IR Command to turn on the AC
+
+      acTurnOnTime = xTaskGetTickCount();
+      tempWhenTurnedOn = localData.temp;
+
+      if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        sharedData.acStatus = true;
+        sharedData.acTargetTemp = 24;
+        sharedData.acHealthAlert = false;
+        xSemaphoreGive(dataMutex);
+      }
+      Serial.println("[LOGIKA] Orang terdeteksi di ruangan. Menyalakan AC default 24°C.");
+    }
+
+    // 3. DYNAMIC THERMOSTAT (Penyesuaian Suhu Otomatis saat AC Aktif)
+    if (localData.acStatus && !isnan(localData.temp)) {
+      if (localData.temp < 21.0 && localData.acTargetTemp != 25) {
+        // Terlalu Dingin -> Naikkan ke 25°C
+        
+        if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+          sharedData.acTargetTemp = 25;
+          xSemaphoreGive(dataMutex);
+        }
+        Serial.println("[LOGIKA] Ruangan terlalu dingin. Target AC dinaikkan ke 25°C.");
+      }
+      else if (localData.temp > 25.5 && localData.acTargetTemp != 23) {
+        // Terlalu Gerah -> Turunkan ke 23°C
+        
+        if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+          sharedData.acTargetTemp = 23;
+          xSemaphoreGive(dataMutex);
+        }
+        Serial.println("[LOGIKA] Ruangan panas. Target AC diturunkan ke 23°C.");
+      }
+      else if (localData.temp >= 21.0 && localData.temp <= 25.5 && localData.acTargetTemp != 24) {
+        // Kembali Normal -> Set 24°C
+       
+        if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+          sharedData.acTargetTemp = 24;
+          xSemaphoreGive(dataMutex);
+        }
+        Serial.println("[LOGIKA] Suhu ruangan normal. Target AC diatur ke 24°C.");
+      }
+
+      // 4. DIAGNOSTIK KESEHATAN AC (Kompresor / Freon Bocor)
+      if (!localData.acHealthAlert && (xTaskGetTickCount() - acTurnOnTime > pdMS_TO_TICKS(AC_HEALTH_CHECK_MS))) {
+        if ((tempWhenTurnedOn - localData.temp) < 1.5 && localData.temp > 25.5) {
+          if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            sharedData.acHealthAlert = true;
+            xSemaphoreGive(dataMutex);
+          }
+          Serial.println("[PERINGATAN] Anomali AC terdeteksi: Suhu tidak turun setelah evaluasi!");
+        }
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+}
 
 void setup() {
   Serial.begin(115200);
@@ -123,15 +208,17 @@ void setup() {
   // Inisialisasi Data Global Awal
   sharedData.temp = 25.0;
   sharedData.humidity = 60.0;
-  sharedData.headcount = 0;
+  sharedData.headcount = 1;
   sharedData.doorOpen = false;
   sharedData.doorOpenSec = 0;
-  sharedData.acStatus = false;
+  sharedData.acStatus = true;
   sharedData.acTargetTemp = 24;
   sharedData.acHealthAlert = false;
 
-  xTaskCreatePinnedToCore(Task_DHT22_Read,      "DHT_Task",     2048, NULL, 2, NULL, 1);
-  xTaskCreatePinnedToCore(Task_HTTP_Telemetry, "HTTP_Task",     8192, NULL, 1, NULL, 1);
+
+  xTaskCreatePinnedToCore(Task_DHT22_Read,         "DHT_Task",  2048, NULL, 2, NULL, 1);
+  xTaskCreatePinnedToCore(Task_HTTP_Telemetry,    "HTTP_Task",  8192, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(Task_AC_Logic,         "Logic_Task",  3072, NULL, 2, NULL, 1);
 
   Serial.println("Node 1 Running");
 }
