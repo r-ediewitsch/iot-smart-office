@@ -3,7 +3,11 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "freertos/timers.h"
+
 #include <DHT.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include "secrets.h"
 
 #define DHTPIN 4
 #define DHTTYPE DHT22
@@ -59,19 +63,42 @@ void Task_HTTP_Telemetry(void *pvParameters) {
       xSemaphoreGive(dataMutex);
     }
 
-    String jsonPayload = "{";
-    jsonPayload += "\"temp\":" + String(localData.temp, 1) + ",";
-    jsonPayload += "\"humidity\":" + String(localData.humidity, 1) + ",";
-    jsonPayload += "\"headcount\":" + String(localData.headcount) + ",";
-    jsonPayload += "\"door_open\":" + String(localData.doorOpen ? "true" : "false") + ",";
-    jsonPayload += "\"door_open_sec\":" + String(localData.doorOpenSec) + ",";
-    jsonPayload += "\"ac_status\":" + String(localData.acStatus ? "true" : "false") + ",";
-    jsonPayload += "\"ac_target_temp\":" + String(localData.acTargetTemp) + ",";
-    jsonPayload += "\"ac_health_alert\":" + String(localData.acHealthAlert ? "true" : "false");
-    jsonPayload += "}";
+    if (WiFi.status() == WL_CONNECTED) {
+      HTTPClient http;
 
-    Serial.println("[JSON PAYLOAD]");
-    Serial.print(jsonPayload);
+      http.begin(FLASK_URL);
+      http.setTimeout(3000);
+
+      
+      http.addHeader("Content-Type", "application/json");
+      http.addHeader("Bypass-Tunnel-Reminder", "true");
+      http.addHeader("User-Agent", "ESP32-SmartOffice");
+
+      String jsonPayload = "{";
+      jsonPayload += "\"temp\":" + String(localData.temp, 1) + ",";
+      jsonPayload += "\"humidity\":" + String(localData.humidity, 1) + ",";
+      jsonPayload += "\"headcount\":" + String(localData.headcount) + ",";
+      jsonPayload += "\"door_open\":" + String(localData.doorOpen ? "true" : "false") + ",";
+      jsonPayload += "\"door_open_sec\":" + String(localData.doorOpenSec) + ",";
+      jsonPayload += "\"ac_status\":" + String(localData.acStatus ? "true" : "false") + ",";
+      jsonPayload += "\"ac_target_temp\":" + String(localData.acTargetTemp) + ",";
+      jsonPayload += "\"ac_health_alert\":" + String(localData.acHealthAlert ? "true" : "false");
+      jsonPayload += "}";
+
+      int httpResponseCode = http.POST(jsonPayload);
+      if (httpResponseCode > 0) {
+        Serial.printf("[HTTP] Data terkirim ke Flask | Status Code: %d\n", httpResponseCode);
+      } else {
+        Serial.printf("[HTTP] Gagal mengirim data | Error: %s\n", http.errorToString(httpResponseCode).c_str());
+      }
+      http.end();
+    } else {
+      Serial.println("[HTTP] Wi-Fi terputus, mencoba rekoneksi...");
+      WiFi.reconnect();
+    }
+
+    // Serial.println("[JSON PAYLOAD]");
+    // Serial.print(jsonPayload);
 
     vTaskDelay(pdMS_TO_TICKS(2500)); // Kirim telemetri setiap 2.5 detik
   }
@@ -81,6 +108,16 @@ void Task_HTTP_Telemetry(void *pvParameters) {
 void setup() {
   Serial.begin(115200);
   dht.begin();
+
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("[Wi-Fi] Menghubungkan");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\n[Wi-Fi] Terhubung!");
+
   dataMutex = xSemaphoreCreateMutex();
 
   // Inisialisasi Data Global Awal
@@ -94,7 +131,7 @@ void setup() {
   sharedData.acHealthAlert = false;
 
   xTaskCreatePinnedToCore(Task_DHT22_Read,      "DHT_Task",     2048, NULL, 2, NULL, 1);
-  xTaskCreatePinnedToCore(Task_HTTP_Telemetry, "HTTP_Task",     2048, NULL, 1, NULL, 0);
+  xTaskCreatePinnedToCore(Task_HTTP_Telemetry, "HTTP_Task",     8192, NULL, 1, NULL, 1);
 
   Serial.println("Node 1 Running");
 }
