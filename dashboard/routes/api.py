@@ -14,6 +14,7 @@ from database import (
     insert_telemetry, insert_event, get_latest_telemetry,
     get_telemetry_history, get_recent_events, detect_and_log_events
 )
+from mqtt_client import publish_command
 
 api_bp = Blueprint('api', __name__)
 
@@ -132,6 +133,7 @@ def override():
 
         if action == 'turn_on':
             insert_event('MANUAL_OVERRIDE', 'Manual override: AC turned ON')
+            publish_command({"action": "SET_POWER", "value": True})
             return jsonify({
                 "status": "ok",
                 "action": "turn_on",
@@ -139,6 +141,7 @@ def override():
             }), 200
         elif action == 'turn_off':
             insert_event('MANUAL_OVERRIDE', 'Manual override: AC turned OFF')
+            publish_command({"action": "SET_POWER", "value": False})
             return jsonify({
                 "status": "ok",
                 "action": "turn_off",
@@ -147,6 +150,7 @@ def override():
         elif action == 'set_temp':
             temp = data.get('temp', 24)
             insert_event('MANUAL_OVERRIDE', f'Manual override: Set temp to {temp}°C')
+            publish_command({"action": "SET_TEMP", "target": temp})
             return jsonify({
                 "status": "ok",
                 "action": "set_temp",

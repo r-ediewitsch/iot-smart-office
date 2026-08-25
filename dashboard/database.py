@@ -2,10 +2,11 @@
 database.py — SQLite helpers for Smart Office Dashboard
 """
 
+import os
 import sqlite3
 from datetime import datetime
 
-DB_PATH = 'smart_office.db'
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'smart_office.db')
 
 _last_state = {
     'headcount': None,

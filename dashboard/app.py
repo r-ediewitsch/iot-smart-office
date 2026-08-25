@@ -11,6 +11,7 @@ from flask import Flask
 from database import init_db
 from routes.api import api_bp
 from routes.views import views_bp
+from mqtt_client import start_mqtt
 
 app = Flask(__name__)
 
@@ -28,4 +29,5 @@ def add_cors_headers(response):
 
 if __name__ == '__main__':
     init_db()
+    start_mqtt(app)
     app.run(host='0.0.0.0', port=5000, debug=True)
