@@ -9,9 +9,12 @@
 #include <Adafruit_PN532.h>
 #include "secrets.h"
 
-#define BUZZER_PIN 2                // Modul Active Buzzer
+#define DOOR_PIN    19              // Sensor MC-38
+#define BUZZER_PIN   2              // Modul Active Buzzer
 #define PN532_IRQ   -1              // Mode I2C Standar tanpa IRQ fisik
 #define PN532_RESET -1
+
+const unsigned long DOOR_ALARM_LIMIT_SEC = 10;
 
 enum BuzzerEvent {
   BEEP_TAP_IN,
@@ -107,9 +110,9 @@ void Task_NFC_Read(void *pvParameters) {
       }
 
       // Debounce card tap (2 detik jeda antar tap)
-      if (currentCardId != lastProcessedUID || (millis() - lastCardTapTime > 2000)) {
+      if (currentCardId != lastProcessedUID || (xTaskGetTickCount() - lastCardTapTime > pdMS_TO_TICKS(2000))) {
         lastProcessedUID = currentCardId;
-        lastCardTapTime = millis();
+        lastCardTapTime = xTaskGetTickCount();
 
         bool inside = isCardInside(currentCardId);
         BuzzerEvent bEvt;
@@ -143,11 +146,63 @@ void Task_NFC_Read(void *pvParameters) {
   }
 }
   
+// ================= TASK 3: SENSOR PINTU MC-38 =================
+void Task_Door_Switch(void *pvParameters) {
+  TickType_t doorOpenStart = 0;
+  TickType_t lastAlarmTick = 0; // Timer untuk membatasi pengiriman alarm ke antrean
+  bool lastState = (digitalRead(DOOR_PIN) == HIGH);
+
+  for (;;) {
+    bool isDoorOpen = (digitalRead(DOOR_PIN) == HIGH);
+
+    if (isDoorOpen) {
+      if (!lastState) {
+        doorOpenStart = xTaskGetTickCount();
+        Serial.println("[PINTU] Terbuka!");
+      }
+      
+      unsigned long elapsedSec = (doorOpenStart > 0) 
+        ? (xTaskGetTickCount() - doorOpenStart) / pdMS_TO_TICKS(1000) 
+        : 0;
+
+      if (xSemaphoreTake(doorMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        sharedDoorData.doorOpen = true;
+        sharedDoorData.doorOpenSec = elapsedSec;
+        xSemaphoreGive(doorMutex);
+      }
+
+      // Kirim event alarm secara berkala (tiap 1.5 detik sekali) agar tidak membanjiri queue
+      if (elapsedSec >= DOOR_ALARM_LIMIT_SEC) {
+        if ((xTaskGetTickCount() - lastAlarmTick) >= pdMS_TO_TICKS(1500)) {
+          lastAlarmTick = xTaskGetTickCount();
+          BuzzerEvent bEvt = BEEP_ALARM_DOOR;
+          xQueueSend(buzzerQueue, &bEvt, 0);
+        }
+      }
+    } else {
+      if (lastState) {
+        Serial.println("[PINTU] Tertutup Rapat.");
+      }
+      doorOpenStart = 0;
+      lastAlarmTick = 0; // Reset timer alarm
+
+      if (xSemaphoreTake(doorMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        sharedDoorData.doorOpen = false;
+        sharedDoorData.doorOpenSec = 0;
+        xSemaphoreGive(doorMutex);
+      }
+    }
+
+    lastState = isDoorOpen;
+    vTaskDelay(pdMS_TO_TICKS(200));
+  }
+}
 
 void setup() {
   Serial.begin(115200);
 
   pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(DOOR_PIN, INPUT_PULLUP);
   digitalWrite(BUZZER_PIN, LOW);
 
   nfc.begin();
@@ -179,6 +234,7 @@ void setup() {
 
   xTaskCreatePinnedToCore(Task_Buzzer,      "Buzzer_Task",   2048, NULL, 4, NULL, 1);
   xTaskCreatePinnedToCore(Task_NFC_Read,    "NFC_Task",      3072, NULL, 3, NULL, 1);
+  xTaskCreatePinnedToCore(Task_Door_Switch, "Door_Task",     2048, NULL, 2, NULL, 1);
 
   Serial.println("Node 2 Running");
 }
