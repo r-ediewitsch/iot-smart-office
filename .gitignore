@@ -26,14 +26,11 @@ htmlcov/
 .nox/
 .hypothesis/
 
-# Virtual Environments
-venv/
-ENV/
-env/
-.env/
-.venv/
-env.bak/
-venv.bak/
+# Environment Variables
+.env
+.env.*
+*.env
+!.env.example
 
 # Database
 *.db

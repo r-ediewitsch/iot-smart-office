@@ -6,7 +6,7 @@
 
 #include <DHT.h>
 #include <WiFi.h>
-#include <HTTPClient.h>
+#include <PubSubClient.h>
 #include "secrets.h"
 
 #define DHTPIN 4
@@ -29,8 +29,10 @@ struct SharedData {
 // Handle FreeRTOS
 SemaphoreHandle_t dataMutex;
 
-// Inisialisasi Objek Hardware
+// Inisialisasi Objek Hardware & Klien Jaringan
 DHT dht(DHTPIN, DHTTYPE);
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
 
 // Variabel Waktu Diagnostik
 unsigned long acTurnOnTime = 0;
@@ -57,51 +59,60 @@ void Task_DHT22_Read(void *pvParameters) {
   }
 }
 
-// ================= TASK 2: HTTP TELEMETRY =================
-void Task_HTTP_Telemetry(void *pvParameters) {
+// ================= TASK 2: MQTT TELEMETRY =================
+void Task_MQTT_Telemetry(void *pvParameters) {
   for (;;) {
-    SharedData localData;
-    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-      localData = sharedData;
-      xSemaphoreGive(dataMutex);
-    }
-
     if (WiFi.status() == WL_CONNECTED) {
-      HTTPClient http;
+      // Reconnect MQTT jika terputus
+      if (!mqttClient.connected()) {
+        Serial.print("[MQTT] Menghubungkan ke broker...");
+        String clientId = "ESP32_Node2_" + String(random(0xffff), HEX);
+        
+        #if defined(MQTT_USER) && defined(MQTT_PASSWORD)
+          bool connected = mqttClient.connect(clientId.c_str(), MQTT_USER, MQTT_PASSWORD);
+        #else
+          bool connected = mqttClient.connect(clientId.c_str());
+        #endif
 
-      http.begin(FLASK_URL);
-      http.setTimeout(3000);
-
-      
-      http.addHeader("Content-Type", "application/json");
-      http.addHeader("Bypass-Tunnel-Reminder", "true");
-      http.addHeader("User-Agent", "ESP32-SmartOffice");
-
-      String jsonPayload = "{";
-      jsonPayload += "\"temp\":" + String(localData.temp, 1) + ",";
-      jsonPayload += "\"humidity\":" + String(localData.humidity, 1) + ",";
-      jsonPayload += "\"headcount\":" + String(localData.headcount) + ",";
-      jsonPayload += "\"door_open\":" + String(localData.doorOpen ? "true" : "false") + ",";
-      jsonPayload += "\"door_open_sec\":" + String(localData.doorOpenSec) + ",";
-      jsonPayload += "\"ac_status\":" + String(localData.acStatus ? "true" : "false") + ",";
-      jsonPayload += "\"ac_target_temp\":" + String(localData.acTargetTemp) + ",";
-      jsonPayload += "\"ac_health_alert\":" + String(localData.acHealthAlert ? "true" : "false");
-      jsonPayload += "}";
-
-      int httpResponseCode = http.POST(jsonPayload);
-      if (httpResponseCode > 0) {
-        Serial.printf("[HTTP] Data terkirim ke Flask | Status Code: %d\n", httpResponseCode);
-      } else {
-        Serial.printf("[HTTP] Gagal mengirim data | Error: %s\n", http.errorToString(httpResponseCode).c_str());
+        if (connected) {
+          Serial.println(" Terhubung!");
+        } else {
+          Serial.printf(" Gagal, rc=%d. Coba lagi nanti.\n", mqttClient.state());
+        }
       }
-      http.end();
+
+      // Jika MQTT aktif, kirim data telemetri
+      if (mqttClient.connected()) {
+        mqttClient.loop();
+
+        SharedData localData;
+        if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+          localData = sharedData;
+          xSemaphoreGive(dataMutex);
+        }
+
+        String jsonPayload = "{";
+        jsonPayload += "\"temp\":" + String(localData.temp, 1) + ",";
+        jsonPayload += "\"humidity\":" + String(localData.humidity, 1) + ",";
+        jsonPayload += "\"headcount\":" + String(localData.headcount) + ",";
+        jsonPayload += "\"door_open\":" + String(localData.doorOpen ? "true" : "false") + ",";
+        jsonPayload += "\"door_open_sec\":" + String(localData.doorOpenSec) + ",";
+        jsonPayload += "\"ac_status\":" + String(localData.acStatus ? "true" : "false") + ",";
+        jsonPayload += "\"ac_target_temp\":" + String(localData.acTargetTemp) + ",";
+        jsonPayload += "\"ac_health_alert\":" + String(localData.acHealthAlert ? "true" : "false");
+        jsonPayload += "}";
+
+        bool published = mqttClient.publish("office/telemetry", jsonPayload.c_str());
+        if (published) {
+          Serial.println("[MQTT] Data telemetri berhasil di-publish ke office/telemetry");
+        } else {
+          Serial.println("[MQTT] Gagal publish data!");
+        }
+      }
     } else {
-      Serial.println("[HTTP] Wi-Fi terputus, mencoba rekoneksi...");
+      Serial.println("[Wi-Fi] Terputus, mencoba rekoneksi...");
       WiFi.reconnect();
     }
-
-    // Serial.println("[JSON PAYLOAD]");
-    // Serial.print(jsonPayload);
 
     vTaskDelay(pdMS_TO_TICKS(2500)); // Kirim telemetri setiap 2.5 detik
   }
@@ -203,6 +214,10 @@ void setup() {
   }
   Serial.println("\n[Wi-Fi] Terhubung!");
 
+  // Konfigurasi MQTT Broker
+  mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
+  mqttClient.setBufferSize(512); // Menjamin ukuran buffer muat seluruh payload JSON
+
   dataMutex = xSemaphoreCreateMutex();
 
   // Inisialisasi Data Global Awal
@@ -215,14 +230,13 @@ void setup() {
   sharedData.acTargetTemp = 24;
   sharedData.acHealthAlert = false;
 
+  xTaskCreatePinnedToCore(Task_DHT22_Read,      "DHT_Task",   2048, NULL, 2, NULL, 1);
+  xTaskCreatePinnedToCore(Task_MQTT_Telemetry,  "MQTT_Task",  4096, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(Task_AC_Logic,        "Logic_Task", 3072, NULL, 2, NULL, 1);
 
-  xTaskCreatePinnedToCore(Task_DHT22_Read,         "DHT_Task",  2048, NULL, 2, NULL, 1);
-  xTaskCreatePinnedToCore(Task_HTTP_Telemetry,    "HTTP_Task",  8192, NULL, 1, NULL, 1);
-  xTaskCreatePinnedToCore(Task_AC_Logic,         "Logic_Task",  3072, NULL, 2, NULL, 1);
-
-  Serial.println("Node 1 Running");
+  Serial.println("Node 2 Running");
 }
 
 void loop() {
-  // Aku nak sedikit aksi
+  // FreeRTOS mengelola seluruh eksekusi task
 }
