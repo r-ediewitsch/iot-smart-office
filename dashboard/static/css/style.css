@@ -219,6 +219,12 @@ header h1 {
 .temp-control {
     display: flex;
     align-items: center;
+    justify-content: space-between;
+}
+
+.temp-control-left {
+    display: flex;
+    align-items: center;
     gap: 0.5rem;
 }
 
@@ -245,6 +251,15 @@ header h1 {
 
 .btn-set-temp:hover {
     background: var(--accent-primary-hover);
+}
+
+.btn-set-auto {
+    background: var(--accent-amber);
+    color: white;
+}
+
+.btn-set-auto:hover {
+    background: #b45309;
 }
 
 .ac-health {

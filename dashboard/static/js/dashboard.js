@@ -248,6 +248,15 @@ document.getElementById('btn-set-temp').addEventListener('click', async () => {
     }
 });
 
+document.getElementById('btn-set-auto').addEventListener('click', async () => {
+    await fetch('/api/override', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'set_auto' })
+    });
+    fetchEventLog();
+});
+
 setInterval(fetchLiveStatus, LIVE_POLL_MS);
 setInterval(fetchEventLog, EVENT_POLL_MS);
 

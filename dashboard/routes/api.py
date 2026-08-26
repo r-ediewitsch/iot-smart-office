@@ -156,6 +156,14 @@ def override():
                 "action": "set_temp",
                 "message": f"Manual override: Set temp to {temp}°C"
             }), 200
+        elif action == 'set_auto':
+            insert_event('MANUAL_OVERRIDE', 'Manual override: Return to automatic mode')
+            publish_command({"action": "SET_AUTO"})
+            return jsonify({
+                "status": "ok",
+                "action": "set_auto",
+                "message": "Return to automatic mode"
+            }), 200
         else:
             return jsonify({"error": "Invalid action"}), 400
     except Exception as e:
