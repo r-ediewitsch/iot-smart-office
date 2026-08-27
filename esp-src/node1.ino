@@ -8,13 +8,24 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
+#include <IRremoteESP8266.h>
+#include <ir_Daikin.h>
 #include "secrets.h"
 
-#define DHTPIN 4
+// ================= PIN & KONFIGURASI =================
+#define DHTPIN 26
 #define DHTTYPE DHT22
+#define IR_LED_PIN 25               // Pin Data LED Transmitter IR
+#define STATUS_LED 2                // LED indikator onboard
 
 const unsigned long DOOR_TIMEOUT_SEC   = 180;
 const unsigned long AC_HEALTH_CHECK_MS = 1800000; // 30 menit
+
+// ================= STRUKTUR DATA =================
+struct IRCommand {
+  char action;                      // 'O' = ON, 'F' = OFF, 'S' = SET_TEMP
+  int targetTemp;
+};
 
 struct SharedData {
   float temp;
@@ -25,19 +36,55 @@ struct SharedData {
   bool acStatus;
   int acTargetTemp;
   bool acHealthAlert;
-  bool manualOverride; 
+  bool manualOverride;
 } sharedData;
 
+// Handle FreeRTOS & Objek Hardware
 SemaphoreHandle_t dataMutex;
+QueueHandle_t irQueue;
 
 DHT dht(DHTPIN, DHTTYPE);
+IRDaikinESP ac(IR_LED_PIN);
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
 
+// Variabel Waktu Diagnostik
 unsigned long acTurnOnTime = 0;
 float tempWhenTurnedOn = 0.0;
 
-// ================= HANDLER PESAN MQTT MASUK (MANUAL OVERRIDE) =================
+// ================= TASK 1: IR TRANSMITTER =================
+void Task_IR_Transmit(void *pvParameters) {
+  IRCommand cmd;
+  for (;;) {
+    if (xQueueReceive(irQueue, &cmd, portMAX_DELAY) == pdPASS) {
+      digitalWrite(STATUS_LED, HIGH);
+
+      if (cmd.action == 'O') {
+        ac.on();
+        ac.setMode(kDaikinCool);
+        ac.setFan(kDaikinFanAuto);
+        ac.setTemp(cmd.targetTemp);
+        ac.send();
+        Serial.printf("[IR EXEC] AC ON | Mode: COOL | Target: %d°C\n", cmd.targetTemp);
+      } 
+      else if (cmd.action == 'F') {
+        ac.off();
+        ac.send();
+        Serial.println("[IR EXEC] AC OFF");
+      } 
+      else if (cmd.action == 'S') {
+        ac.setTemp(cmd.targetTemp);
+        ac.send();
+        Serial.printf("[IR EXEC] SET TEMPERATURE: %d°C\n", cmd.targetTemp);
+      }
+
+      vTaskDelay(pdMS_TO_TICKS(150));
+      digitalWrite(STATUS_LED, LOW);
+    }
+  }
+}
+
+// ================= HANDLER PESAN MQTT MASUK =================
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
   char message[length + 1];
   memcpy(message, payload, length);
@@ -50,25 +97,59 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     DeserializationError error = deserializeJson(doc, message);
 
     if (!error) {
-      const char* action = doc["action"]; // "SET_POWER", "SET_TEMP", "SET_AUTO"
+      const char* action = doc["action"];
 
       if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        // 1. OVERRIDE POWER AC (ON / OFF)
         if (strcmp(action, "SET_POWER") == 0) {
-          sharedData.acStatus = doc["value"].as<bool>();
-          sharedData.manualOverride = true; // Kunci kontrol manual
+          bool targetState = false;
+          auto val = doc.containsKey("value") ? doc["value"] : doc["state"];
+
+          if (val.is<bool>()) {
+            targetState = val.as<bool>();
+          } else if (val.is<int>()) {
+            targetState = (val.as<int>() == 1);
+          } else if (val.is<const char*>()) {
+            const char* s = val;
+            targetState = (strcasecmp(s, "true") == 0 || strcasecmp(s, "on") == 0 || strcmp(s, "1") == 0);
+          }
+
+          sharedData.acStatus = targetState;
+          sharedData.manualOverride = true;
+
           if (sharedData.acStatus) {
             acTurnOnTime = xTaskGetTickCount();
             tempWhenTurnedOn = sharedData.temp;
           }
+
+          // Kirim perintah IR ke antrean
+          IRCommand cmd;
+          cmd.action = targetState ? 'O' : 'F';
+          cmd.targetTemp = sharedData.acTargetTemp;
+          xQueueSend(irQueue, &cmd, 0);
+
           Serial.printf("[OVERRIDE] Status AC diubah manual ke: %s\n", sharedData.acStatus ? "ON" : "OFF");
         } 
+        // 2. OVERRIDE TARGET SUHU
         else if (strcmp(action, "SET_TEMP") == 0) {
-          sharedData.acTargetTemp = doc["target"].as<int>();
-          sharedData.manualOverride = true; // Kunci kontrol manual agar tidak ditimpa Dynamic Thermostat
-          Serial.printf("[OVERRIDE] Target Suhu AC diubah manual ke: %d°C\n", sharedData.acTargetTemp);
+          int target = doc.containsKey("value") ? doc["value"].as<int>() : doc["target"].as<int>();
+          if (target >= 16 && target <= 30) {
+            sharedData.acTargetTemp = target;
+            sharedData.manualOverride = true;
+
+            // Jika AC sedang menyala, langsung kirim update sinyal IR
+            if (sharedData.acStatus) {
+              IRCommand cmd;
+              cmd.action = 'S';
+              cmd.targetTemp = target;
+              xQueueSend(irQueue, &cmd, 0);
+            }
+            Serial.printf("[OVERRIDE] Target Suhu AC diubah manual ke: %d°C\n", sharedData.acTargetTemp);
+          }
         }
-        else if (strcmp(action, "SET_AUTO") == 0) {
-          sharedData.manualOverride = false; // Kembalikan ke mode otomatis penuh
+        // 3. KEMBALI KE MODE OTOMATIS
+        else if (strcmp(action, "SET_AUTO") == 0 || (strcmp(action, "SET_MODE") == 0 && (doc["value"] == "auto" || doc["mode"] == "auto"))) {
+          sharedData.manualOverride = false;
           Serial.println("[OVERRIDE] Mode Otomatis Dynamic Thermostat Diaktifkan Kembali.");
         }
         xSemaphoreGive(dataMutex);
@@ -79,7 +160,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   }
 }
 
-// ================= TASK 1: READ SENSOR DHT 22 =================
+// ================= TASK 2: READ SENSOR DHT 22 =================
 void Task_DHT22_Read(void *pvParameters) {
   TickType_t xLastWakeTime = xTaskGetTickCount();
   for (;;) {
@@ -100,7 +181,7 @@ void Task_DHT22_Read(void *pvParameters) {
   }
 }
 
-// ================= TASK 2: MQTT TELEMETRY & COMMAND =================
+// ================= TASK 3: MQTT TELEMETRY & GATEWAY =================
 void Task_MQTT_Telemetry(void *pvParameters) {
   for (;;) {
     if (WiFi.status() == WL_CONNECTED) {
@@ -116,7 +197,6 @@ void Task_MQTT_Telemetry(void *pvParameters) {
 
         if (connected) {
           Serial.println(" Terhubung!");
-          // Subscribe ke topik kendali manual dari dashboard
           mqttClient.subscribe("office/ac/command");
           Serial.println("[MQTT] Berhasil subscribe ke office/ac/command");
         } else {
@@ -125,7 +205,7 @@ void Task_MQTT_Telemetry(void *pvParameters) {
       }
 
       if (mqttClient.connected()) {
-        mqttClient.loop(); // Memproses antrean pesan masuk / callback
+        mqttClient.loop();
 
         SharedData localData;
         if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
@@ -156,7 +236,7 @@ void Task_MQTT_Telemetry(void *pvParameters) {
   }
 }
 
-// ================= TASK 3: AC CLIMATE LOGIC =================
+// ================= TASK 4: AC CLIMATE LOGIC (OTOMASI IR) =================
 void Task_AC_Logic(void *pvParameters) {
   for (;;) {
     SharedData localData;
@@ -165,7 +245,7 @@ void Task_AC_Logic(void *pvParameters) {
       xSemaphoreGive(dataMutex);
     }
 
-    // 1. AUTO-OFF: Tetap aktif sebagai proteksi jika ruangan kosong / pintu bocor
+    // 1. AUTO-OFF: Ruangan Kosong atau Pintu Terbuka Melebihi Batas
     if (localData.acStatus) {
       if (localData.headcount <= 0 || (localData.doorOpen && localData.doorOpenSec > DOOR_TIMEOUT_SEC)) {
         if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
@@ -173,11 +253,16 @@ void Task_AC_Logic(void *pvParameters) {
           sharedData.manualOverride = false; // Reset override jika mati otomatis
           xSemaphoreGive(dataMutex);
         }
+
+        // Matikan AC lewat sinyal IR
+        IRCommand cmd = {'F', 0};
+        xQueueSend(irQueue, &cmd, 0);
+
         Serial.println("[LOGIKA] AC dimatikan otomatis (Pintu Terbuka/Ruangan Kosong).");
       }
     }
 
-    // 2. AUTO-ON: Hanya berjalan jika TIDAK dalam mode manual override
+    // 2. AUTO-ON: Ada Orang & Pintu Tidak Bocor
     if (!localData.manualOverride && !localData.acStatus && localData.headcount > 0 && !(localData.doorOpen && localData.doorOpenSec > DOOR_TIMEOUT_SEC)) {
       acTurnOnTime = xTaskGetTickCount();
       tempWhenTurnedOn = localData.temp;
@@ -188,34 +273,43 @@ void Task_AC_Logic(void *pvParameters) {
         sharedData.acHealthAlert = false;
         xSemaphoreGive(dataMutex);
       }
+
+      // Nyalakan AC lewat sinyal IR dengan target default 24°C
+      IRCommand cmd = {'O', 24};
+      xQueueSend(irQueue, &cmd, 0);
+
       Serial.println("[LOGIKA] Orang terdeteksi di ruangan. Menyalakan AC default 24°C.");
     }
 
-    // 3. DYNAMIC THERMOSTAT: Hanya menyesuaikan suhu otomatis jika TIDAK dalam manual override
+    // 3. DYNAMIC THERMOSTAT (Penyesuaian Suhu Otomatis saat AC Aktif)
     if (!localData.manualOverride && localData.acStatus && !isnan(localData.temp)) {
+      int newTarget = localData.acTargetTemp;
+
       if (localData.temp < 21.0 && localData.acTargetTemp != 25) {
-        if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-          sharedData.acTargetTemp = 25;
-          xSemaphoreGive(dataMutex);
-        }
+        newTarget = 25;
         Serial.println("[LOGIKA] Ruangan terlalu dingin. Target AC dinaikkan ke 25°C.");
       }
       else if (localData.temp > 25.5 && localData.acTargetTemp != 23) {
-        if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-          sharedData.acTargetTemp = 23;
-          xSemaphoreGive(dataMutex);
-        }
+        newTarget = 23;
         Serial.println("[LOGIKA] Ruangan panas. Target AC diturunkan ke 23°C.");
       }
       else if (localData.temp >= 21.0 && localData.temp <= 25.5 && localData.acTargetTemp != 24) {
-        if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-          sharedData.acTargetTemp = 24;
-          xSemaphoreGive(dataMutex);
-        }
+        newTarget = 24;
         Serial.println("[LOGIKA] Suhu ruangan normal. Target AC diatur ke 24°C.");
       }
 
-      // 4. DIAGNOSTIK KESEHATAN AC
+      // Jika ada penyesuaian suhu target, update shared data & kirim sinyal IR
+      if (newTarget != localData.acTargetTemp) {
+        if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+          sharedData.acTargetTemp = newTarget;
+          xSemaphoreGive(dataMutex);
+        }
+
+        IRCommand cmd = {'S', newTarget};
+        xQueueSend(irQueue, &cmd, 0);
+      }
+
+      // 4. DIAGNOSTIK KESEHATAN AC (Kompresor / Freon Bocor)
       if (!localData.acHealthAlert && (xTaskGetTickCount() - acTurnOnTime > pdMS_TO_TICKS(AC_HEALTH_CHECK_MS))) {
         if ((tempWhenTurnedOn - localData.temp) < 1.5 && localData.temp > 25.5) {
           if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
@@ -231,9 +325,15 @@ void Task_AC_Logic(void *pvParameters) {
   }
 }
 
+// ================= SETUP =================
 void setup() {
   Serial.begin(115200);
+  
+  pinMode(STATUS_LED, OUTPUT);
+  digitalWrite(STATUS_LED, LOW);
+
   dht.begin();
+  ac.begin();
 
   WiFi.mode(WIFI_AP_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -249,24 +349,27 @@ void setup() {
   mqttClient.setBufferSize(512);
 
   dataMutex = xSemaphoreCreateMutex();
+  irQueue   = xQueueCreate(10, sizeof(IRCommand));
 
-  sharedData.temp = 25.0;
-  sharedData.humidity = 60.0;
-  sharedData.headcount = 1;
-  sharedData.doorOpen = false;
-  sharedData.doorOpenSec = 0;
-  sharedData.acStatus = true;
-  sharedData.acTargetTemp = 24;
-  sharedData.acHealthAlert = false;
-  sharedData.manualOverride = false;
+  sharedData.temp            = 25.0;
+  sharedData.humidity        = 60.0;
+  sharedData.headcount       = 1;
+  sharedData.doorOpen        = false;
+  sharedData.doorOpenSec     = 0;
+  sharedData.acStatus        = true;
+  sharedData.acTargetTemp    = 24;
+  sharedData.acHealthAlert   = false;
+  sharedData.manualOverride  = false;
 
-  xTaskCreatePinnedToCore(Task_DHT22_Read,      "DHT_Task",   2048, NULL, 2, NULL, 1);
+  // Task Pinning ke Dual-Core
+  xTaskCreatePinnedToCore(Task_IR_Transmit,     "IR_Task",    2048, NULL, 4, NULL, 1);
+  xTaskCreatePinnedToCore(Task_DHT22_Read,      "DHT_Task",   3584, NULL, 2, NULL, 1);
   xTaskCreatePinnedToCore(Task_MQTT_Telemetry,  "MQTT_Task",  4096, NULL, 1, NULL, 1);
   xTaskCreatePinnedToCore(Task_AC_Logic,        "Logic_Task", 3072, NULL, 2, NULL, 1);
 
-  Serial.println("Node 2 Running");
+  Serial.println("Node 2 (Gateway & Climate Hub) Siap.");
 }
 
 void loop() {
-  // FreeRTOS mengelola task
+  // Aku nak sedikit aksi
 }
