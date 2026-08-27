@@ -2,10 +2,6 @@
 routes/api.py — REST API endpoints for Smart Office Dashboard
 """
 
-import time
-import random
-import threading
-from datetime import datetime
 from flask import Blueprint, request, jsonify, current_app
 import sys
 import os
@@ -14,49 +10,9 @@ from database import (
     insert_telemetry, insert_event, get_latest_telemetry,
     get_telemetry_history, get_recent_events, detect_and_log_events
 )
-from mqtt_client import publish_command
+from mqtt_client import publish_command, is_demo_active, set_demo_active
 
 api_bp = Blueprint('api', __name__)
-
-demo_running = False
-demo_thread = None
-
-
-def demo_loop(app):
-    temp = 24.0
-    headcount = 0
-    door_open = False
-    ac_on = False
-    target = 24
-
-    with app.app_context():
-        while demo_running:
-            temp += random.uniform(-0.3, 0.3)
-            temp = max(18.0, min(32.0, temp))
-
-            if random.random() < 0.1:
-                headcount = max(0, headcount + random.choice([-1, 1]))
-            if random.random() < 0.05:
-                door_open = not door_open
-
-            ac_on = headcount > 0 and not (door_open and random.random() < 0.3)
-            target = 24 if temp > 25.5 else (25 if temp < 21 else 24)
-
-            payload = {
-                "temp": round(temp, 1),
-                "humidity": round(random.uniform(45, 70), 1),
-                "headcount": headcount,
-                "door_open": door_open,
-                "door_open_sec": random.randint(0, 15) if door_open else 0,
-                "ac_status": ac_on,
-                "ac_target_temp": target,
-                "ac_health_alert": False
-            }
-
-            insert_telemetry(payload)
-            detect_and_log_events(payload, is_demo=True)
-
-            time.sleep(2)
 
 
 @api_bp.route('/telemetry', methods=['POST'])
@@ -90,7 +46,10 @@ def live_status():
             "door_open_sec": telemetry['door_open_sec'],
             "ac_status": bool(telemetry['ac_status']),
             "ac_target_temp": telemetry['ac_target_temp'],
-            "ac_health_alert": bool(telemetry['ac_health_alert'])
+            "ac_health_alert": bool(telemetry['ac_health_alert']),
+            "last_uid": telemetry.get('last_uid'),
+            "last_action": telemetry.get('last_action'),
+            "demo_mode": is_demo_active()
         }), 200
     except Exception as e:
         current_app.logger.error(f"Live status error: {e}")
@@ -173,36 +132,24 @@ def override():
 
 @api_bp.route('/demo', methods=['POST'])
 def toggle_demo():
-    global demo_running, demo_thread
     try:
         data = request.get_json(force=True)
         action = data.get('action', 'toggle')
 
-        if action == 'start' and not demo_running:
-            demo_running = True
-            demo_thread = threading.Thread(
-                target=demo_loop,
-                args=(current_app._get_current_object(),),
-                daemon=True
-            )
-            demo_thread.start()
-            return jsonify({"demo": True, "message": "Demo mode started"}), 200
+        if action == 'start':
+            set_demo_active(True)
+            publish_command({"action": "SET_DEMO", "value": True})
+            return jsonify({"demo": True, "message": "Demo mode started (ESP)"}), 200
         elif action == 'stop':
-            demo_running = False
-            return jsonify({"demo": False, "message": "Demo mode stopped"}), 200
+            set_demo_active(False)
+            publish_command({"action": "SET_DEMO", "value": False})
+            return jsonify({"demo": False, "message": "Demo mode stopped (ESP)"}), 200
         elif action == 'toggle':
-            if demo_running:
-                demo_running = False
-                return jsonify({"demo": False, "message": "Demo mode stopped"}), 200
-            else:
-                demo_running = True
-                demo_thread = threading.Thread(
-                    target=demo_loop,
-                    args=(current_app._get_current_object(),),
-                    daemon=True
-                )
-                demo_thread.start()
-                return jsonify({"demo": True, "message": "Demo mode started"}), 200
+            new_state = not is_demo_active()
+            set_demo_active(new_state)
+            publish_command({"action": "SET_DEMO", "value": new_state})
+            return jsonify({"demo": new_state,
+                            "message": f"Demo mode {'started' if new_state else 'stopped'} (ESP)"}), 200
         else:
             return jsonify({"error": "Invalid action"}), 400
     except Exception as e:

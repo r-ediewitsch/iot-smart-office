@@ -12,6 +12,8 @@ _last_state = {
     'headcount': None,
     'ac_target_temp': None,
     'ac_on_since': None,
+    'last_uid': None,
+    'last_action': None,
 }
 
 def get_db():
@@ -33,16 +35,31 @@ def init_db():
                 door_open_sec   INTEGER NOT NULL DEFAULT 0,
                 ac_status       INTEGER NOT NULL DEFAULT 0,
                 ac_target_temp  INTEGER NOT NULL DEFAULT 24,
-                ac_health_alert INTEGER NOT NULL DEFAULT 0
+                ac_health_alert INTEGER NOT NULL DEFAULT 0,
+                last_uid        TEXT,
+                last_action     TEXT
             );
 
             CREATE TABLE IF NOT EXISTS event_logs (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp   TEXT NOT NULL DEFAULT (datetime('now')),
                 event_type  TEXT NOT NULL,
-                message     TEXT NOT NULL
+                message     TEXT NOT NULL,
+                uid         TEXT
             );
         ''')
+
+        # Migration: tambahkan kolom uid jika belum ada (DB lama)
+        cols = [row[1] for row in conn.execute("PRAGMA table_info(event_logs)").fetchall()]
+        if 'uid' not in cols:
+            conn.execute("ALTER TABLE event_logs ADD COLUMN uid TEXT")
+
+        # Migration: tambahkan kolom last_uid/last_action pada telemetry jika belum ada
+        tel_cols = [row[1] for row in conn.execute("PRAGMA table_info(telemetry)").fetchall()]
+        if 'last_uid' not in tel_cols:
+            conn.execute("ALTER TABLE telemetry ADD COLUMN last_uid TEXT")
+        if 'last_action' not in tel_cols:
+            conn.execute("ALTER TABLE telemetry ADD COLUMN last_action TEXT")
 
 def cleanup_old_telemetry():
     with get_db() as conn:
@@ -55,8 +72,8 @@ def insert_telemetry(data: dict):
         conn.execute('''
             INSERT INTO telemetry
                 (temperature, humidity, headcount, door_open, door_open_sec,
-                 ac_status, ac_target_temp, ac_health_alert)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 ac_status, ac_target_temp, ac_health_alert, last_uid, last_action)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             data['temp'],
             data['humidity'],
@@ -65,14 +82,16 @@ def insert_telemetry(data: dict):
             data.get('door_open_sec', 0),
             int(data['ac_status']),
             data.get('ac_target_temp', 24),
-            int(data.get('ac_health_alert', False))
+            int(data.get('ac_health_alert', False)),
+            str(data.get('last_uid')) if data.get('last_uid') else None,
+            data.get('last_action')
         ))
 
-def insert_event(event_type: str, message: str):
+def insert_event(event_type: str, message: str, uid: str = None):
     with get_db() as conn:
         conn.execute(
-            'INSERT INTO event_logs (event_type, message) VALUES (?, ?)',
-            (event_type, message)
+            'INSERT INTO event_logs (event_type, message, uid) VALUES (?, ?, ?)',
+            (event_type, message, uid)
         )
 
 def get_latest_telemetry():
@@ -124,6 +143,16 @@ def get_telemetry_at_time(minutes_ago: int):
 
 def detect_and_log_events(data: dict, is_demo: bool = False):
     prev = _last_state
+    uid = data.get('last_uid')
+    action = data.get('last_action')
+    uid_str = str(uid) if uid and uid != 0 else None
+
+    # ACCESS: NFC tap-in atau tap-out terdeteksi
+    if action in ('I', 'O') and uid and uid != 0:
+        label = 'MASUK' if action == 'I' else 'KELUAR'
+        insert_event('ACCESS',
+                     f"Staf {label} (UID: {uid_str}) — headcount: {data['headcount']}",
+                     uid=uid_str)
 
     if prev['headcount'] is not None and prev['headcount'] > 0 and data['headcount'] == 0:
         insert_event('LAST_PERSON_OUT', 'Room empty — AC auto-OFF triggered')
@@ -148,3 +177,5 @@ def detect_and_log_events(data: dict, is_demo: bool = False):
 
     _last_state['headcount'] = data['headcount']
     _last_state['ac_target_temp'] = data.get('ac_target_temp')
+    _last_state['last_uid'] = uid
+    _last_state['last_action'] = action

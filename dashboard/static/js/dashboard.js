@@ -39,6 +39,12 @@ async function fetchLiveStatus() {
         updateKPICards(data);
         updateChart(data);
         updateConnectionStatus(true);
+
+        // Sync demo mode state with server
+        if (data.demo_mode !== undefined && data.demo_mode !== isDemoMode) {
+            isDemoMode = data.demo_mode;
+            document.getElementById('btn-demo-toggle').classList.toggle('active', isDemoMode);
+        }
     } catch (err) {
         updateConnectionStatus(false);
     }
@@ -199,6 +205,7 @@ function renderEventTable(events) {
         <tr class="event-row event-${e.event_type}">
             <td>${formatWIBFull(e.timestamp)}</td>
             <td><span class="event-badge">${e.event_type}</span></td>
+            <td class="uid-cell">${e.uid || '-'}</td>
             <td>${e.message}</td>
         </tr>
     `).join('');

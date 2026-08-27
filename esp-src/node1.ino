@@ -21,6 +21,7 @@
 
 const unsigned long DOOR_TIMEOUT_SEC   = 180;
 const unsigned long AC_HEALTH_CHECK_MS = 1800000; // 30 menit
+const unsigned long OVERRIDE_TIMEOUT_MS = 3600000; // 60 menit
 
 // ================= STRUKTUR DATA =================
 typedef struct __attribute__((packed)) struct_message {
@@ -50,6 +51,7 @@ struct SharedData {
   int acTargetTemp;
   bool acHealthAlert;
   bool manualOverride;
+  bool demoMode;
 } sharedData;
 
 // Handle FreeRTOS & Objek Hardware
@@ -64,6 +66,7 @@ PubSubClient mqttClient(espClient);
 // Variabel Waktu Diagnostik
 unsigned long acTurnOnTime = 0;
 float tempWhenTurnedOn = 0.0;
+TickType_t overrideStartTime = 0;
 
 // ================= CALLBACK ESP-NOW (DATA MASUK DARI NODE 1) =================
 void OnDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *incomingData, int len) {
@@ -74,6 +77,14 @@ void OnDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *incomingDat
 
   memcpy(&incomingDoorData, incomingData, sizeof(incomingDoorData));
 
+  // Variabel statis untuk memantau perubahan status
+  static bool prevDoorOpen = false;
+  static int prevHeadcount = -1;
+
+  bool hasAction        = (incomingDoorData.lastAction != '-');
+  bool doorStateChanged = (incomingDoorData.doorOpen != prevDoorOpen);
+  bool headcountChanged = (incomingDoorData.headcount != prevHeadcount);
+
   if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
     sharedData.headcount   = incomingDoorData.headcount;
     sharedData.doorOpen    = incomingDoorData.doorOpen;
@@ -83,14 +94,19 @@ void OnDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *incomingDat
     xSemaphoreGive(dataMutex);
   }
 
-  Serial.printf("[ESP-NOW RX] Headcount: %d | Pintu: %s (%lus) | UID: 0x%08X | Aksi: %c\n",
-                incomingDoorData.headcount,
-                incomingDoorData.doorOpen ? "TERBUKA" : "RAPAT",
-                incomingDoorData.doorOpenSec,
-                incomingDoorData.lastUid,
-                incomingDoorData.lastAction);
-}
+  // Hanya print ke Serial jika ada event kartu atau transisi status penting
+  if (hasAction || doorStateChanged || headcountChanged) {
+    Serial.printf("[ESP-NOW EVENT] Headcount: %d | Pintu: %s (%lus) | UID: 0x%08X | Aksi: %c\n",
+                  incomingDoorData.headcount,
+                  incomingDoorData.doorOpen ? "TERBUKA" : "RAPAT",
+                  incomingDoorData.doorOpenSec,
+                  incomingDoorData.lastUid,
+                  incomingDoorData.lastAction);
 
+    prevDoorOpen  = incomingDoorData.doorOpen;
+    prevHeadcount = incomingDoorData.headcount;
+  }
+}
 // ================= TASK 1: IR TRANSMITTER =================
 void Task_IR_Transmit(void *pvParameters) {
   IRCommand cmd;
@@ -155,6 +171,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 
           sharedData.acStatus = targetState;
           sharedData.manualOverride = true;
+          overrideStartTime = xTaskGetTickCount();
 
           if (sharedData.acStatus) {
             acTurnOnTime = xTaskGetTickCount();
@@ -175,6 +192,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
           if (target >= 16 && target <= 30) {
             sharedData.acTargetTemp = target;
             sharedData.manualOverride = true;
+            overrideStartTime = xTaskGetTickCount();
 
             // Jika AC sedang menyala, langsung kirim update sinyal IR
             if (sharedData.acStatus) {
@@ -191,6 +209,19 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
           sharedData.manualOverride = false;
           Serial.println("[OVERRIDE] Mode Otomatis Dynamic Thermostat Diaktifkan Kembali.");
         }
+        // 4. KONTROL DEMO MODE
+        else if (strcmp(action, "SET_DEMO") == 0) {
+          auto val = doc.containsKey("value") ? doc["value"] : doc["state"];
+          if (val.is<bool>()) {
+            sharedData.demoMode = val.as<bool>();
+          } else if (val.is<int>()) {
+            sharedData.demoMode = (val.as<int>() == 1);
+          } else if (val.is<const char*>()) {
+            const char* s = val;
+            sharedData.demoMode = (strcasecmp(s, "true") == 0 || strcasecmp(s, "on") == 0 || strcmp(s, "1") == 0);
+          }
+          Serial.printf("[SYSTEM] DEMO MODE: %s\n", sharedData.demoMode ? "ACTIVE (Fast Timers & Sim Cycle)" : "DISABLED (Normal)");
+        }
         xSemaphoreGive(dataMutex);
       }
     } else {
@@ -202,20 +233,49 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 // ================= TASK 2: READ SENSOR DHT 22 =================
 void Task_DHT22_Read(void *pvParameters) {
   TickType_t xLastWakeTime = xTaskGetTickCount();
-  for (;;) {
-    float h = dht.readHumidity();
-    float t = dht.readTemperature();
+  static float simTemp = 28.0;
+  static int simDirection = -1; // -1: mendingin, +1: memanas
 
-    if (!isnan(h) && !isnan(t)) {
+  for (;;) {
+    bool isDemo = false;
+    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+      isDemo = sharedData.demoMode;
+      xSemaphoreGive(dataMutex);
+    }
+
+    if (isDemo) {
+      // Siklus suhu simulasi dinamis untuk menguji respons Dynamic Thermostat
+      simTemp += simDirection * 0.5;
+      if (simTemp <= 19.5) {
+        simTemp = 19.5;
+        simDirection = 1;
+      } else if (simTemp >= 28.5) {
+        simTemp = 28.5;
+        simDirection = -1;
+      }
+
       if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        sharedData.temp = t;
-        sharedData.humidity = h;
+        sharedData.temp = simTemp;
+        sharedData.humidity = 55.0;
         xSemaphoreGive(dataMutex);
       }
-      Serial.printf("[DHT] Temp: %.2f, Humidity: %.2f\n", t, h);
+      Serial.printf("[DHT SIM] Temp: %.2f°C, Humidity: 55.0%%\n", simTemp);
     } else {
-      Serial.println("[DHT] Gagal membaca sensor!");
+      float h = dht.readHumidity();
+      float t = dht.readTemperature();
+
+      if (!isnan(h) && !isnan(t)) {
+        if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+          sharedData.temp = t;
+          sharedData.humidity = h;
+          xSemaphoreGive(dataMutex);
+        }
+        Serial.printf("[DHT] Temp: %.2f, Humidity: %.2f\n", t, h);
+      } else {
+        Serial.println("[DHT] Gagal membaca sensor!");
+      }
     }
+
     vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(1000));
   }
 }
@@ -263,7 +323,8 @@ void Task_MQTT_Telemetry(void *pvParameters) {
         jsonPayload += "\"ac_status\":" + String(localData.acStatus ? "true" : "false") + ",";
         jsonPayload += "\"ac_target_temp\":" + String(localData.acTargetTemp) + ",";
         jsonPayload += "\"ac_health_alert\":" + String(localData.acHealthAlert ? "true" : "false") + ",";
-        jsonPayload += "\"manual_override\":" + String(localData.manualOverride ? "true" : "false");
+        jsonPayload += "\"manual_override\":" + String(localData.manualOverride ? "true" : "false") + ",";
+        jsonPayload += "\"demo_mode\":" + String(localData.demoMode ? "true" : "false");
         jsonPayload += "}";
 
         mqttClient.publish("office/telemetry", jsonPayload.c_str());
@@ -286,9 +347,23 @@ void Task_AC_Logic(void *pvParameters) {
       xSemaphoreGive(dataMutex);
     }
 
+    // Skala durasi waktu berdasarkan status Demo Mode
+    unsigned long activeDoorTimeoutSec    = localData.demoMode ? 15 : DOOR_TIMEOUT_SEC;
+    unsigned long activeHealthCheckMs     = localData.demoMode ? 30000 : AC_HEALTH_CHECK_MS;
+    unsigned long activeOverrideTimeoutMs = localData.demoMode ? 45000 : OVERRIDE_TIMEOUT_MS;
+
+    // Failsafe: Melepas Override Manual setelah periode timeout tercapai
+    if (localData.manualOverride && (xTaskGetTickCount() - overrideStartTime > pdMS_TO_TICKS(activeOverrideTimeoutMs))) {
+      if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        sharedData.manualOverride = false;
+        xSemaphoreGive(dataMutex);
+      }
+      Serial.println("[OVERRIDE-TIMEOUT] Batas waktu kontrol manual habis. Kembali ke Mode Auto.");
+    }
+
     // 1. AUTO-OFF: Ruangan Kosong atau Pintu Terbuka Melebihi Batas
     if (localData.acStatus) {
-      if (localData.headcount <= 0 || (localData.doorOpen && localData.doorOpenSec > DOOR_TIMEOUT_SEC)) {
+      if (localData.headcount <= 0 || (localData.doorOpen && localData.doorOpenSec > activeDoorTimeoutSec)) {
         if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
           sharedData.acStatus = false;
           sharedData.manualOverride = false; // Reset override jika mati otomatis
@@ -304,7 +379,7 @@ void Task_AC_Logic(void *pvParameters) {
     }
 
     // 2. AUTO-ON: Ada Orang & Pintu Tidak Bocor
-    if (!localData.manualOverride && !localData.acStatus && localData.headcount > 0 && !(localData.doorOpen && localData.doorOpenSec > DOOR_TIMEOUT_SEC)) {
+    if (!localData.manualOverride && !localData.acStatus && localData.headcount > 0 && !(localData.doorOpen && localData.doorOpenSec > activeDoorTimeoutSec)) {
       acTurnOnTime = xTaskGetTickCount();
       tempWhenTurnedOn = localData.temp;
 
@@ -351,7 +426,7 @@ void Task_AC_Logic(void *pvParameters) {
       }
 
       // 4. DIAGNOSTIK KESEHATAN AC (Kompresor / Freon Bocor)
-      if (!localData.acHealthAlert && (xTaskGetTickCount() - acTurnOnTime > pdMS_TO_TICKS(AC_HEALTH_CHECK_MS))) {
+      if (!localData.acHealthAlert && (xTaskGetTickCount() - acTurnOnTime > pdMS_TO_TICKS(activeHealthCheckMs))) {
         if ((tempWhenTurnedOn - localData.temp) < 1.5 && localData.temp > 25.5) {
           if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
             sharedData.acHealthAlert = true;
@@ -409,6 +484,7 @@ void setup() {
   sharedData.acTargetTemp    = 24;
   sharedData.acHealthAlert   = false;
   sharedData.manualOverride  = false;
+  sharedData.demoMode        = false;
 
   // Task Pinning ke Dual-Core
   xTaskCreatePinnedToCore(Task_IR_Transmit,     "IR_Task",    2048, NULL, 4, NULL, 1);

@@ -321,3 +321,11 @@ header h1 {
 .event-HEALTH_ALERT .event-badge { background: #fef2f2; color: var(--accent-red); }
 .event-CLIMATE_CHANGE .event-badge { background: #eff6ff; color: var(--accent-primary); }
 .event-MANUAL_OVERRIDE .event-badge { background: #f5f3ff; color: #7c3aed; }
+.event-ACCESS .event-badge { background: #ecfdf5; color: #059669; }
+
+.uid-cell {
+    font-family: 'Courier New', Courier, monospace;
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    white-space: nowrap;
+}

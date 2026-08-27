@@ -17,6 +17,16 @@ TOPIC_COMMAND = 'office/ac/command'
 
 _mqtt_client = None
 _flask_app = None
+demo_active = False
+
+
+def is_demo_active():
+    return demo_active
+
+
+def set_demo_active(state: bool):
+    global demo_active
+    demo_active = state
 
 
 def on_connect(client, userdata, flags, rc):
