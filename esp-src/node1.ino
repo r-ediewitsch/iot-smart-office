@@ -6,6 +6,7 @@
 
 #include <DHT.h>
 #include <WiFi.h>
+#include <esp_now.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <IRremoteESP8266.h>
@@ -22,6 +23,16 @@ const unsigned long DOOR_TIMEOUT_SEC   = 180;
 const unsigned long AC_HEALTH_CHECK_MS = 1800000; // 30 menit
 
 // ================= STRUKTUR DATA =================
+typedef struct __attribute__((packed)) struct_message {
+  int headcount;
+  bool doorOpen;
+  unsigned long doorOpenSec;
+  uint32_t lastUid;
+  char lastAction;
+} struct_message;
+
+struct_message incomingDoorData;
+
 struct IRCommand {
   char action;                      // 'O' = ON, 'F' = OFF, 'S' = SET_TEMP
   int targetTemp;
@@ -33,6 +44,8 @@ struct SharedData {
   int headcount;
   bool doorOpen;
   unsigned long doorOpenSec;
+  uint32_t lastUid;
+  char lastAction;
   bool acStatus;
   int acTargetTemp;
   bool acHealthAlert;
@@ -51,6 +64,32 @@ PubSubClient mqttClient(espClient);
 // Variabel Waktu Diagnostik
 unsigned long acTurnOnTime = 0;
 float tempWhenTurnedOn = 0.0;
+
+// ================= CALLBACK ESP-NOW (DATA MASUK DARI NODE 1) =================
+void OnDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *incomingData, int len) {
+  if (len != sizeof(struct_message)) {
+    Serial.printf("[ESP-NOW RX] Ukuran paket tidak sesuai! Diterima: %d bytes\n", len);
+    return;
+  }
+
+  memcpy(&incomingDoorData, incomingData, sizeof(incomingDoorData));
+
+  if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    sharedData.headcount   = incomingDoorData.headcount;
+    sharedData.doorOpen    = incomingDoorData.doorOpen;
+    sharedData.doorOpenSec = incomingDoorData.doorOpenSec;
+    sharedData.lastUid     = incomingDoorData.lastUid;
+    sharedData.lastAction  = incomingDoorData.lastAction;
+    xSemaphoreGive(dataMutex);
+  }
+
+  Serial.printf("[ESP-NOW RX] Headcount: %d | Pintu: %s (%lus) | UID: 0x%08X | Aksi: %c\n",
+                incomingDoorData.headcount,
+                incomingDoorData.doorOpen ? "TERBUKA" : "RAPAT",
+                incomingDoorData.doorOpenSec,
+                incomingDoorData.lastUid,
+                incomingDoorData.lastAction);
+}
 
 // ================= TASK 1: IR TRANSMITTER =================
 void Task_IR_Transmit(void *pvParameters) {
@@ -219,6 +258,8 @@ void Task_MQTT_Telemetry(void *pvParameters) {
         jsonPayload += "\"headcount\":" + String(localData.headcount) + ",";
         jsonPayload += "\"door_open\":" + String(localData.doorOpen ? "true" : "false") + ",";
         jsonPayload += "\"door_open_sec\":" + String(localData.doorOpenSec) + ",";
+        jsonPayload += "\"last_uid\":\"0x" + String(localData.lastUid, HEX) + "\",";
+        jsonPayload += "\"last_action\":\"" + String(localData.lastAction) + "\",";
         jsonPayload += "\"ac_status\":" + String(localData.acStatus ? "true" : "false") + ",";
         jsonPayload += "\"ac_target_temp\":" + String(localData.acTargetTemp) + ",";
         jsonPayload += "\"ac_health_alert\":" + String(localData.acHealthAlert ? "true" : "false") + ",";
@@ -344,6 +385,14 @@ void setup() {
   }
   Serial.println("\n[Wi-Fi] Terhubung!");
 
+  // Inisialisasi ESP-NOW Receiver
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("[ERROR] Inisialisasi ESP-NOW Gagal!");
+  } else {
+    esp_now_register_recv_cb(OnDataRecv);
+    Serial.println("[ESP-NOW] Terhubung & Siap Menerima Data dari Node 2.");
+  }
+
   mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
   mqttClient.setCallback(mqttCallback);
   mqttClient.setBufferSize(512);
@@ -353,10 +402,10 @@ void setup() {
 
   sharedData.temp            = 25.0;
   sharedData.humidity        = 60.0;
-  sharedData.headcount       = 1;
+  sharedData.headcount       = 0;
   sharedData.doorOpen        = false;
   sharedData.doorOpenSec     = 0;
-  sharedData.acStatus        = true;
+  sharedData.acStatus        = false;
   sharedData.acTargetTemp    = 24;
   sharedData.acHealthAlert   = false;
   sharedData.manualOverride  = false;
@@ -367,7 +416,7 @@ void setup() {
   xTaskCreatePinnedToCore(Task_MQTT_Telemetry,  "MQTT_Task",  4096, NULL, 1, NULL, 1);
   xTaskCreatePinnedToCore(Task_AC_Logic,        "Logic_Task", 3072, NULL, 2, NULL, 1);
 
-  Serial.println("Node 2 (Gateway & Climate Hub) Siap.");
+  Serial.println("Node 1 Ready.");
 }
 
 void loop() {

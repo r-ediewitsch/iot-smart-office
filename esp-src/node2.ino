@@ -5,6 +5,7 @@
 #include "freertos/timers.h"
 
 #include <WiFi.h>
+#include <esp_now.h>
 #include <Wire.h>
 #include <Adafruit_PN532.h>
 #include "secrets.h"
@@ -15,6 +16,20 @@
 #define PN532_RESET -1
 
 const unsigned long DOOR_ALARM_LIMIT_SEC = 10;
+
+// ================= MAC ADDRESS & ESP-NOW CONFIG =================
+uint8_t broadcastAddress[] = NODE1_MAC;
+
+typedef struct __attribute__((packed)) struct_message {
+  int headcount;
+  bool doorOpen;
+  unsigned long doorOpenSec;
+  uint32_t lastUid;
+  char lastAction;
+} struct_message;
+
+struct_message outgoingData;
+esp_now_peer_info_t peerInfo;
 
 enum BuzzerEvent {
   BEEP_TAP_IN,
@@ -198,6 +213,33 @@ void Task_Door_Switch(void *pvParameters) {
   }
 }
 
+// ================= TASK 4: ESP-NOW SENDER =================
+void Task_ESPNOW_Send(void *pvParameters) {
+  for (;;) {
+    SharedDoorData localCopy;
+
+    if (xSemaphoreTake(doorMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+      localCopy = sharedDoorData;
+      // Reset action flag ke '-' setelah disalin agar tidak terkirim ganda di broadcast berkala
+      sharedDoorData.lastAction = '-';
+      xSemaphoreGive(doorMutex);
+    }
+
+    outgoingData.headcount   = localCopy.headcount;
+    outgoingData.doorOpen    = localCopy.doorOpen;
+    outgoingData.doorOpenSec = localCopy.doorOpenSec;
+    outgoingData.lastUid     = localCopy.lastUid;
+    outgoingData.lastAction  = localCopy.lastAction;
+
+    esp_err_t result = esp_now_send(broadcastAddress, (uint8_t *) &outgoingData, sizeof(outgoingData));
+    if (result != ESP_OK) {
+      Serial.println("[ESP-NOW] Gagal mengirim paket data");
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(800)); // Broadcast data tiap 800 ms
+  }
+}
+
 void setup() {
   Serial.begin(115200);
 
@@ -223,6 +265,21 @@ void setup() {
   }
   Serial.println("\n[Wi-Fi] Terhubung!");
 
+  // Inisialisasi ESP-NOW
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("[ERROR] Inisialisasi ESP-NOW Gagal!");
+  } else {
+    memcpy(peerInfo.peer_addr, broadcastAddress, 6);
+    peerInfo.channel = 0;
+    peerInfo.encrypt = false;
+    
+    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+      Serial.println("[ERROR] Gagal mendaftarkan peer Node 2!");
+    } else {
+      Serial.println("[ESP-NOW] Peer Node 2 Terdaftar.");
+    }
+  }
+
   doorMutex   = xSemaphoreCreateMutex();
   buzzerQueue = xQueueCreate(10, sizeof(BuzzerEvent));
 
@@ -235,8 +292,9 @@ void setup() {
   xTaskCreatePinnedToCore(Task_Buzzer,      "Buzzer_Task",   2048, NULL, 4, NULL, 1);
   xTaskCreatePinnedToCore(Task_NFC_Read,    "NFC_Task",      3072, NULL, 3, NULL, 1);
   xTaskCreatePinnedToCore(Task_Door_Switch, "Door_Task",     2048, NULL, 2, NULL, 1);
+  xTaskCreatePinnedToCore(Task_ESPNOW_Send, "ESPNOW_Task",   3072, NULL, 2, NULL, 0); // Core 0 (Network)
 
-  Serial.println("Node 2 Running");
+  Serial.println("Node 2 Ready.");
 }
 
 void loop() {
