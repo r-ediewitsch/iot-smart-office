@@ -39,6 +39,16 @@ struct IRCommand {
   int targetTemp;
 };
 
+struct AccessEvent {
+  uint32_t uid;
+  char action;
+  int headcount;
+};
+
+#define ACCESS_BUFFER_SIZE 8
+AccessEvent accessBuffer[ACCESS_BUFFER_SIZE];
+int accessBufferCount = 0;
+
 struct SharedData {
   float temp;
   float humidity;
@@ -92,6 +102,16 @@ void OnDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *incomingDat
     sharedData.lastUid     = incomingDoorData.lastUid;
     sharedData.lastAction  = incomingDoorData.lastAction;
     xSemaphoreGive(dataMutex);
+  }
+
+  // Buffer akses event agar tidak ter-overwrite sebelum MQTT publish
+  if (hasAction && accessBufferCount < ACCESS_BUFFER_SIZE) {
+    accessBuffer[accessBufferCount].uid        = incomingDoorData.lastUid;
+    accessBuffer[accessBufferCount].action     = incomingDoorData.lastAction;
+    accessBuffer[accessBufferCount].headcount  = incomingDoorData.headcount;
+    accessBufferCount++;
+    Serial.printf("[ACCESS BUFFER] Tersimpan: UID=0x%08X Aksi=%c (buffer=%d)\n",
+                  incomingDoorData.lastUid, incomingDoorData.lastAction, accessBufferCount);
   }
 
   // Hanya print ke Serial jika ada event kartu atau transisi status penting
@@ -282,59 +302,100 @@ void Task_DHT22_Read(void *pvParameters) {
 
 // ================= TASK 3: MQTT TELEMETRY & GATEWAY =================
 void Task_MQTT_Telemetry(void *pvParameters) {
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+  const TickType_t ACCESS_CHECK_MS = pdMS_TO_TICKS(200);
+  const TickType_t TELEMETRY_INTERVAL_MS = pdMS_TO_TICKS(2500);
+  TickType_t lastTelemetryTime = 0;
+
   for (;;) {
-    if (WiFi.status() == WL_CONNECTED) {
-      if (!mqttClient.connected()) {
-        Serial.println("[MQTT] Menghubungkan ke broker...");
-        String clientId = "ESP32_Node2_" + String(random(0xffff), HEX);
-        
-        #if defined(MQTT_USER) && defined(MQTT_PASSWORD)
-          bool connected = mqttClient.connect(clientId.c_str(), MQTT_USER, MQTT_PASSWORD);
-        #else
-          bool connected = mqttClient.connect(clientId.c_str());
-        #endif
-
-        if (connected) {
-          Serial.println(" Terhubung!");
-          mqttClient.subscribe("office/ac/command");
-          Serial.println("[MQTT] Berhasil subscribe ke office/ac/command");
-        } else {
-          Serial.printf(" Gagal, rc=%d. Coba lagi nanti.\n", mqttClient.state());
-        }
-      }
-
-      if (mqttClient.connected()) {
-        mqttClient.loop();
-
-        SharedData localData;
-        if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-          localData = sharedData;
-          xSemaphoreGive(dataMutex);
-        }
-
-        String jsonPayload = "{";
-        jsonPayload += "\"temp\":" + String(localData.temp, 1) + ",";
-        jsonPayload += "\"humidity\":" + String(localData.humidity, 1) + ",";
-        jsonPayload += "\"headcount\":" + String(localData.headcount) + ",";
-        jsonPayload += "\"door_open\":" + String(localData.doorOpen ? "true" : "false") + ",";
-        jsonPayload += "\"door_open_sec\":" + String(localData.doorOpenSec) + ",";
-        jsonPayload += "\"last_uid\":\"0x" + String(localData.lastUid, HEX) + "\",";
-        jsonPayload += "\"last_action\":\"" + String(localData.lastAction) + "\",";
-        jsonPayload += "\"ac_status\":" + String(localData.acStatus ? "true" : "false") + ",";
-        jsonPayload += "\"ac_target_temp\":" + String(localData.acTargetTemp) + ",";
-        jsonPayload += "\"ac_health_alert\":" + String(localData.acHealthAlert ? "true" : "false") + ",";
-        jsonPayload += "\"manual_override\":" + String(localData.manualOverride ? "true" : "false") + ",";
-        jsonPayload += "\"demo_mode\":" + String(localData.demoMode ? "true" : "false");
-        jsonPayload += "}";
-
-        mqttClient.publish("office/telemetry", jsonPayload.c_str());
-      }
-    } else {
+    // === WIFI CONNECT ===
+    if (WiFi.status() != WL_CONNECTED) {
       Serial.println("[Wi-Fi] Terputus, mencoba rekoneksi...");
       WiFi.reconnect();
+      vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(1000));
+      continue;
     }
 
-    vTaskDelay(pdMS_TO_TICKS(2500));
+    if (!mqttClient.connected()) {
+      Serial.println("[MQTT] Menghubungkan ke broker...");
+      String clientId = "ESP32_Node1_" + String(random(0xffff), HEX);
+      
+      #if defined(MQTT_USER) && defined(MQTT_PASSWORD)
+        bool connected = mqttClient.connect(clientId.c_str(), MQTT_USER, MQTT_PASSWORD);
+      #else
+        bool connected = mqttClient.connect(clientId.c_str());
+      #endif
+
+      if (connected) {
+        Serial.println("[MQTT] Terhubung!");
+        mqttClient.subscribe("office/ac/command");
+        Serial.println("[MQTT] Subscribe ke office/ac/command");
+      } else {
+        Serial.printf("[MQTT] Gagal, rc=%d\n", mqttClient.state());
+        vTaskDelayUntil(&xLastWakeTime, ACCESS_CHECK_MS);
+        continue;
+      }
+    }
+
+    mqttClient.loop();
+
+    // === ACCESS EVENT: publish SEGERA (tiap 200ms cek) ===
+    if (accessBufferCount > 0) {
+      // Copy & reset buffer
+      AccessEvent localBuffer[ACCESS_BUFFER_SIZE];
+      int localCount = accessBufferCount;
+      for (int i = 0; i < localCount; i++) {
+        localBuffer[i] = accessBuffer[i];
+      }
+      accessBufferCount = 0;
+
+      for (int i = 0; i < localCount; i++) {
+        AccessEvent &evt = localBuffer[i];
+        String accessPayload = "{";
+        accessPayload += "\"uid\":\"0x" + String(evt.uid, HEX) + "\",";
+        accessPayload += "\"action\":\"" + String(evt.action == 'I' ? "IN" : "OUT") + "\",";
+        accessPayload += "\"current_headcount\":" + String(evt.headcount);
+        accessPayload += "}";
+
+        bool ok = mqttClient.publish("office/access/event", accessPayload.c_str());
+        Serial.printf("[MQTT TX] office/access/event: UID=0x%08X %s headcount=%d [%s]\n",
+                      evt.uid, evt.action == 'I' ? "IN" : "OUT",
+                      evt.headcount, ok ? "OK" : "GAGAL");
+      }
+    }
+
+    // === TELEMETRY: publish tiap 2500ms ===
+    TickType_t now = xTaskGetTickCount();
+    if ((now - lastTelemetryTime) >= TELEMETRY_INTERVAL_MS) {
+      lastTelemetryTime = now;
+
+      SharedData localData;
+      if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        localData = sharedData;
+        xSemaphoreGive(dataMutex);
+      }
+
+      String jsonPayload = "{";
+      jsonPayload += "\"temp\":" + String(localData.temp, 1) + ",";
+      jsonPayload += "\"humidity\":" + String(localData.humidity, 1) + ",";
+      jsonPayload += "\"headcount\":" + String(localData.headcount) + ",";
+      jsonPayload += "\"door_open\":" + String(localData.doorOpen ? "true" : "false") + ",";
+      jsonPayload += "\"door_open_sec\":" + String(localData.doorOpenSec) + ",";
+      jsonPayload += "\"last_uid\":\"0x" + String(localData.lastUid, HEX) + "\",";
+      jsonPayload += "\"last_action\":\"" + String(localData.lastAction) + "\",";
+      jsonPayload += "\"ac_status\":" + String(localData.acStatus ? "true" : "false") + ",";
+      jsonPayload += "\"ac_target_temp\":" + String(localData.acTargetTemp) + ",";
+      jsonPayload += "\"ac_health_alert\":" + String(localData.acHealthAlert ? "true" : "false") + ",";
+      jsonPayload += "\"manual_override\":" + String(localData.manualOverride ? "true" : "false") + ",";
+      jsonPayload += "\"demo_mode\":" + String(localData.demoMode ? "true" : "false");
+      jsonPayload += "}";
+
+      bool ok = mqttClient.publish("office/telemetry", jsonPayload.c_str());
+      Serial.printf("[MQTT TX] office/telemetry: temp=%.1f head=%d [%s]\n",
+                    localData.temp, localData.headcount, ok ? "OK" : "GAGAL");
+    }
+
+    vTaskDelayUntil(&xLastWakeTime, ACCESS_CHECK_MS);
   }
 }
 
@@ -489,7 +550,7 @@ void setup() {
   // Task Pinning ke Dual-Core
   xTaskCreatePinnedToCore(Task_IR_Transmit,     "IR_Task",    2048, NULL, 4, NULL, 1);
   xTaskCreatePinnedToCore(Task_DHT22_Read,      "DHT_Task",   3584, NULL, 2, NULL, 1);
-  xTaskCreatePinnedToCore(Task_MQTT_Telemetry,  "MQTT_Task",  4096, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(Task_MQTT_Telemetry,  "MQTT_Task",  8192, NULL, 1, NULL, 1);
   xTaskCreatePinnedToCore(Task_AC_Logic,        "Logic_Task", 3072, NULL, 2, NULL, 1);
 
   Serial.println("Node 1 Ready.");

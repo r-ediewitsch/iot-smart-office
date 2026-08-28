@@ -143,16 +143,6 @@ def get_telemetry_at_time(minutes_ago: int):
 
 def detect_and_log_events(data: dict, is_demo: bool = False):
     prev = _last_state
-    uid = data.get('last_uid')
-    action = data.get('last_action')
-    uid_str = str(uid) if uid and uid != 0 else None
-
-    # ACCESS: NFC tap-in atau tap-out terdeteksi
-    if action in ('I', 'O') and uid and uid != 0:
-        label = 'MASUK' if action == 'I' else 'KELUAR'
-        insert_event('ACCESS',
-                     f"Staf {label} (UID: {uid_str}) — headcount: {data['headcount']}",
-                     uid=uid_str)
 
     if prev['headcount'] is not None and prev['headcount'] > 0 and data['headcount'] == 0:
         insert_event('LAST_PERSON_OUT', 'Room empty — AC auto-OFF triggered')
@@ -177,5 +167,3 @@ def detect_and_log_events(data: dict, is_demo: bool = False):
 
     _last_state['headcount'] = data['headcount']
     _last_state['ac_target_temp'] = data.get('ac_target_temp')
-    _last_state['last_uid'] = uid
-    _last_state['last_action'] = action

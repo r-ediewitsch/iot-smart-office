@@ -48,8 +48,9 @@ def on_message(client, userdata, msg):
                 action = payload.get('action', 'UNKNOWN')
                 uid = payload.get('uid', '?')
                 headcount = payload.get('current_headcount', '?')
-                message = f"{action}: Card {uid} — headcount now {headcount}"
-                insert_event('ACCESS', message)
+                label = 'MASUK' if action == 'IN' else 'KELUAR'
+                message = f"Staf {label} (UID: {uid}) — headcount: {headcount}"
+                insert_event('ACCESS', message, uid=str(uid))
 
     except Exception as e:
         print(f"[MQTT] Error processing message: {e}")
